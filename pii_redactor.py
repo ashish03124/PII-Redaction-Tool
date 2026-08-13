@@ -55,24 +55,24 @@ class PiiRegistry:
         elif entity_type == "EMAIL_ADDRESS":
             fake_val = self._generate_fake_email(clean_key)
         elif entity_type == "PHONE_NUMBER":
-            if clean_key.startswith("+91") or clean_key.startswith("91"):
-                # Clean and keep +91 structure
+            if clean_key.startswith("+91") or clean_key.startswith("91") or clean_key.startswith("+ 91"):
                 fake_val = "+91 " + "".join(self.faker.msisdn()[3:])
             else:
                 fake_val = self.faker.phone_number()
         elif entity_type == "COMPANY":
             fake_val = self.faker.company()
-            # Ensure it sounds like a company and retains similar suffix structure
             if "limited" in key_lower and "limited" not in fake_val.lower():
                 fake_val += " Limited"
             elif "pvt" in key_lower and "private" not in fake_val.lower():
                 fake_val += " Private Limited"
+            elif "llp" in key_lower and "llp" not in fake_val.lower():
+                fake_val += ", LLP"
+            elif "associates" in key_lower and "associates" not in fake_val.lower():
+                fake_val += " & Associates"
         elif entity_type == "ADDRESS":
-            # Clean newlines and double commas
             fake_val = self.faker.address().replace("\n", ", ")
         elif entity_type == "DATE_OF_BIRTH":
             dob = self.faker.date_of_birth(minimum_age=25, maximum_age=80)
-            # Try to match the format of the original string
             if re.search(r'[a-zA-Z]', clean_key):
                 fake_val = dob.strftime("%B %d, %Y")
             else:
@@ -101,9 +101,9 @@ class PiiRegistry:
 class CompanyRecognizer(EntityRecognizer):
     def __init__(self):
         super().__init__(supported_entities=["COMPANY"])
-        # Suffix-based regex for Indian and global companies
+        # Matches capitalized words and ampersands/commas followed by corporate suffixes
         self.company_regex = re.compile(
-            r"\b[A-Z0-9][A-Za-z0-9&\s.,-]{2,60}\s+(?:Limited|Private Limited|Pvt\.?\s*Ltd\.?|LLP|LTD|Inc\.?|Corp\.?|Corporation|Bank|Securities|Holdings|Solutions)\b",
+            r"\b(?:[A-Z0-9][A-Za-z0-9]*\b(?:\s*,\s*|\s+)?|&\s+|and\s+){1,6}(?:Limited|Private Limited|Pvt\.?\s*Ltd\.?|LLP|LTD|Inc\.?|Corp\.?|Corporation|Bank|Securities|Holdings|Solutions|Associates|Partners|Co\.?)\b",
             re.UNICODE
         )
 
@@ -130,12 +130,14 @@ class CompanyRecognizer(EntityRecognizer):
                             overlap = True
                             break
                     if not overlap:
-                        results.append(RecognizerResult(
-                            entity_type="COMPANY",
-                            start=start,
-                            end=end,
-                            score=0.75
-                        ))
+                        # Avoid adding large sentences that spaCy misclassifies
+                        if (end - start) < 65:
+                            results.append(RecognizerResult(
+                                entity_type="COMPANY",
+                                start=start,
+                                end=end,
+                                score=0.75
+                            ))
         return results
 
 
@@ -143,14 +145,21 @@ class AddressRecognizer(EntityRecognizer):
     def __init__(self):
         super().__init__(supported_entities=["ADDRESS"])
         self.address_keywords = re.compile(
-            r"\b(?:Flat|Plot|House|Shop|Building|Tower|Office|Block|No\.?|Opposite|Opp\.?|Near|Behind|Beside|Floor|Road|Street|Lane|Nagar|Wadi|Chakan|Khed|Pune|Mumbai|Delhi|Bangalore|Kolkata|Chennai|Maharashtra|India|Gopal House)\b",
+            r"\b(?:Flat|Plot|House|Shop|Building|Tower|Office|Block|No\.?|Opposite|Opp\.?|Near|Behind|Beside|Floor|Road|Street|Lane|Nagar|Wadi|Chakan|Khed|Pune|Mumbai|Delhi|Bangalore|Kolkata|Chennai|Maharashtra|India|Gopal House|Village|Complex|Peth|Vihar)\b",
             re.IGNORECASE
         )
         self.pincode_regex = re.compile(r"\b\d{6}\b|\b\d{3}\s?\d{3}\b")
-        # Regex matching structured address blocks
+        
+        # Matches structured address blocks starting with a digit or keyword and ending with pin/state/country
         self.address_regex = re.compile(
-            r"\b\d+[-/a-zA-Z0-9\s,]{0,12}\s+(?:Floor|Flat|Plot|Shop|Building|Tower|Office|Block|House|Opposite|Opp\.?|Near|Behind|Beside|Road|Street|Lane|Nagar|Wadi|Chakan|Khed|Pune|Mumbai|Delhi|Bangalore|Kolkata|Chennai|Maharashtra|India|Gopal House)[a-zA-Z0-9\s,()./&–-]{10,200}(?:\b\d{3}\s?\d{3}\b|\bIndia\b|\bMaharashtra\b)",
+            r"\b(?:Flat|Plot|House|Shop|Building|Tower|Office|Block|No\.?|\d+)[-/a-zA-Z0-9\s,]{0,50}\s+(?:Floor|Flat|Plot|Shop|Building|Tower|Office|Block|House|Opposite|Opp\.?|Near|Behind|Beside|Road|Street|Lane|Nagar|Wadi|Chakan|Khed|Pune|Mumbai|Delhi|Bangalore|Kolkata|Chennai|Maharashtra|India|Gopal House|Village|Complex|Peth|Vihar)[a-zA-Z0-9\s,()./&–-]{2,200}(?:\b\d{6}\b|\b\d{3}\s?\d{3}\b|\bIndia\b|\bMaharashtra\b)",
             re.UNICODE | re.IGNORECASE
+        )
+        
+        # Context-based registered office address matcher
+        self.office_address_pattern = re.compile(
+            r"\b(?:office|address|located|at)\s+(?:at|is|of)?\s*([A-Z][a-zA-Z0-9\s,.-]{5,100}?(?:Pune|Mumbai|Delhi|Bangalore|Kolkata|Chennai|Maharashtra|India))\b",
+            re.IGNORECASE
         )
 
     def analyze(self, text, entities, nlp_artifacts=None):
@@ -164,12 +173,29 @@ class AddressRecognizer(EntityRecognizer):
                 score=0.85
             ))
 
-        # 2. Extract GPE, LOC, FAC entities from spaCy as potential addresses if context matches
+        # 2. Context office match
+        for match in self.office_address_pattern.finditer(text):
+            start = match.start(1)
+            end = match.end(1)
+            overlap = False
+            for r in results:
+                if not (end <= r.start or start >= r.end):
+                    overlap = True
+                    break
+            if not overlap:
+                results.append(RecognizerResult(
+                    entity_type="ADDRESS",
+                    start=start,
+                    end=end,
+                    score=0.80
+                ))
+
+        # 3. Extract GPE, LOC, FAC entities from spaCy as potential addresses if context matches
         if nlp_artifacts and nlp_artifacts.entities:
             for ent in nlp_artifacts.entities:
                 if ent.label_ in ["GPE", "LOC", "FAC"]:
                     start, end = ent.start_char, ent.end_char
-                    # Check overlap with regex matches
+                    # Check overlap
                     overlap = False
                     for r in results:
                         if not (end <= r.start or start >= r.end):
@@ -177,8 +203,8 @@ class AddressRecognizer(EntityRecognizer):
                             break
                     if not overlap:
                         # Scan context around entity
-                        context_start = max(0, start - 50)
-                        context_end = min(len(text), end + 50)
+                        context_start = max(0, start - 60)
+                        context_end = min(len(text), end + 60)
                         context = text[context_start:context_end]
                         if self.address_keywords.search(context) or self.pincode_regex.search(context):
                             results.append(RecognizerResult(
@@ -193,13 +219,9 @@ class AddressRecognizer(EntityRecognizer):
 class DateOfBirthRecognizer(EntityRecognizer):
     def __init__(self):
         super().__init__(supported_entities=["DATE_OF_BIRTH"])
-        # Matches dates where year is 1900-2015
         self.date_patterns = [
-            # DD/MM/YYYY or DD-MM-YYYY
             re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-](?:19\d{2}|20[0-1]\d)\b"),
-            # YYYY-MM-DD
             re.compile(r"\b(?:19\d{2}|20[0-1]\d)[/-]\d{1,2}[/-]\d{1,2}\b"),
-            # Month DD, YYYY or DD Month YYYY
             re.compile(
                 r"\b(?:\d{1,2}\s+)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:\s*,\s*|\s+)(?:19\d{2}|20[0-1]\d)\b",
                 re.IGNORECASE
@@ -242,6 +264,27 @@ class NameSalutationRecognizer(EntityRecognizer):
             ))
         return results
 
+
+class NameRoleRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["PERSON"])
+        # Matches capitalized words followed by a corporate role
+        self.role_regex = re.compile(
+            r"\b([A-Z][a-zA-Z']*(?:\s+[A-Z][a-zA-Z']*){1,2})\b\s*,\s*(?:CEO|CFO|CS|Director|Promoter|Auditor|Secretary|Compliance Officer|Chairman|Partner|Manager|Managing Director|Chartered Accountant)\b",
+            re.UNICODE
+        )
+
+    def analyze(self, text, entities, nlp_artifacts=None):
+        results = []
+        for match in self.role_regex.finditer(text):
+            results.append(RecognizerResult(
+                entity_type="PERSON",
+                start=match.start(1),
+                end=match.end(1),
+                score=0.90
+            ))
+        return results
+
 # ==========================================
 # 3. Main PiiRedactor Engine
 # ==========================================
@@ -263,17 +306,36 @@ class PiiRedactor:
         self.analyzer.registry.add_recognizer(AddressRecognizer())
         self.analyzer.registry.add_recognizer(DateOfBirthRecognizer())
         self.analyzer.registry.add_recognizer(NameSalutationRecognizer())
+        self.analyzer.registry.add_recognizer(NameRoleRecognizer())
         
         # Custom phone patterns for Indian format (+91 or space-separated)
         indian_phone = Pattern(
             name="indian_phone",
-            regex=r"\b(?:\+?91[\s-]?)?[6789]\d{9}\b|\b(?:\+?91[\s-]?)?\d{2,4}[\s-]?\d{6,8}\b",
+            regex=r"\b(?:\+?91[\s-]?)?[6789]\d{9}\b|\b(?:\+?91[\s-]?)?\d{2,4}[\s-]?\d{6,8}\b|\b\+?\d{2,4}\s\d{2,4}\s\d{4}\s\d{4}\b",
             score=0.85
         )
         self.analyzer.registry.add_recognizer(PatternRecognizer(
             supported_entity="PHONE_NUMBER", 
             patterns=[indian_phone]
         ))
+        
+        # Custom credit card pattern (for generic 16-digit cards that might fail Luhn checks)
+        generic_cc = Pattern(
+            name="generic_credit_card",
+            regex=r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",
+            score=0.85
+        )
+        self.analyzer.registry.add_recognizer(PatternRecognizer(
+            supported_entity="CREDIT_CARD",
+            patterns=[generic_cc]
+        ))
+
+        # Keywords that indicate a location/company rather than a Person name
+        self.person_blacklist = [
+            "road", "street", "lane", "nagar", "vihar", "taluka", "district", 
+            "wadi", "bhavan", "house", "complex", "building", "limited", 
+            "ltd", "bank", "securities", "pune", "mumbai", "india", "office"
+        ]
 
     def analyze_text(self, text):
         """
@@ -292,10 +354,17 @@ class PiiRedactor:
         # Resolve overlaps
         resolved = self._resolve_overlaps(results)
         
-        # Convert to dictionary format
+        # Filter and convert to dictionary format
         pii_matches = []
         for r in resolved:
             pii_text = text[r.start:r.end]
+            
+            # Post-detection semantic filtering for PERSON false positives
+            if r.entity_type == "PERSON":
+                text_lower = pii_text.lower()
+                if any(kw in text_lower for kw in self.person_blacklist):
+                    continue
+                    
             fake_val = self.registry.get_fake_value(pii_text, r.entity_type)
             pii_matches.append({
                 "start": r.start,
